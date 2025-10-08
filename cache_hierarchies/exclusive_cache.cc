@@ -320,7 +320,15 @@ void CACHE::handle_fill()
 #ifdef PUSH_DTLB_PB
             if ( (cache_type!=IS_DTLB) || (cache_type==IS_DTLB && MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION) )
 #endif	
+            {
                 fill_cache(set, way, &MSHR.entry[mshr_index]);
+                if (lower_level && (cache_type == IS_L1D || cache_type == IS_L1I || cache_type == IS_L2C)) {
+                    auto next_cache = dynamic_cast<CACHE*>(lower_level);
+                    if (next_cache) {
+                        int inval_result = next_cache->invalidate_entry(MSHR.entry[mshr_index].full_addr >> LOG2_BLOCK_SIZE);
+                    }
+                }
+            }
 #ifdef PUSH_DTLB_PB
             else if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION)
             {
