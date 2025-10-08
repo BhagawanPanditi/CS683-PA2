@@ -223,7 +223,11 @@ void CACHE::handle_fill()
                     writeback_packet.data = block[set][way].data;
                     writeback_packet.instr_id = MSHR.entry[mshr_index].instr_id;
                     writeback_packet.ip = 0; // writeback does not have ip
-                    writeback_packet.type = WRITEBACK;
+                    if (block[set][way].dirty) {
+                        writeback_packet.type = WRITEBACK;   // needs to be written back to lower level
+                    } else {
+                        writeback_packet.type = TRANSFER;    // just moving ownership, not dirty
+                    }
                     writeback_packet.event_cycle = current_core_cycle[fill_cpu];
 
                     lower_level->add_wq(&writeback_packet);
@@ -721,7 +725,11 @@ if (writeback_cpu == NUM_CPUS)
                             writeback_packet.data = block[set][way].data;
                             writeback_packet.instr_id = WQ.entry[index].instr_id;
                             writeback_packet.ip = 0;
-                            writeback_packet.type = WRITEBACK;
+                            if (block[set][way].dirty) {
+                                writeback_packet.type = WRITEBACK;   // needs to be written back to lower level
+                            } else {
+                                writeback_packet.type = TRANSFER;    // just moving ownership, not dirty
+                            }
                             writeback_packet.event_cycle = current_core_cycle[writeback_cpu];
 
                             lower_level->add_wq(&writeback_packet);
