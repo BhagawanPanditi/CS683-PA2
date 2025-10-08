@@ -797,7 +797,11 @@ if (writeback_cpu == NUM_CPUS)
                     fill_cache(set, way, &WQ.entry[index]);
 
                     // mark dirty
-                    block[set][way].dirty = 1; 
+                    if (WQ.entry[index].type == WRITEBACK) {
+                        block[set][way].dirty = 1;   // line coming from upper level is dirty
+                    } else if (WQ.entry[index].type == TRANSFER) {
+                        block[set][way].dirty = 0;   // line is just being transferred, not modified
+                    }
 
                     // check fill level
                     if (WQ.entry[index].fill_level < fill_level) {
