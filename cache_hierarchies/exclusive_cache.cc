@@ -809,12 +809,11 @@ if (writeback_cpu == NUM_CPUS)
                             int inval_result = next_cache->invalidate_entry(WQ.entry[index].full_addr >> LOG2_BLOCK_SIZE);
                         }
                     }
-                    // mark dirty
-                    if (WQ.entry[index].type == WRITEBACK) {
-                        block[set][way].dirty = 1;   // line coming from upper level is dirty
-                    } else if (WQ.entry[index].type == TRANSFER) {
+
+                    if (WQ.entry[index].type == TRANSFER)
                         block[set][way].dirty = 0;   // line is just being transferred, not modified
-                    }
+                    else
+                        block[set][way].dirty = 1;
 
                     // check fill level
                     if (WQ.entry[index].fill_level < fill_level) {
