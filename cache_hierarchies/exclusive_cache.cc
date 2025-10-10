@@ -3295,7 +3295,12 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
 
             // check for the latest wirtebacks in the write queue 
             // @Vishal: WQ is non-fifo for L1 cache
-
+            packet->full_physical_address = packet->full_addr;
+            if((fill_level == FILL_L2 && ooo_cpu[cpu].L1D.check_hit(packet)) || (fill_level == FILL_LLC && (ooo_cpu[cpu].L1D.check_hit(packet) || ooo_cpu[cpu].L2C.check_hit(packet)))){
+                PQ.TO_CACHE++;
+                PQ.ACCESS++;
+                return -1;
+            }
             int wq_index;
             if(cache_type == IS_L1D || cache_type == IS_L1I)
                 wq_index = check_nonfifo_queue(&WQ,packet,false);
