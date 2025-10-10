@@ -197,7 +197,7 @@ void CACHE::handle_fill()
 
 
         // is this dirty?
-        if (block[set][way].dirty) {
+        if ((block[set][way].valid && ( cache_type == IS_L1D || cache_type == IS_L1I || cache_type == IS_L2C))|| ( block[set][way].dirty && cache_type == IS_LLC )) {
 
             // check if the lower level WQ has enough room to keep this writeback request
             if (lower_level) {
@@ -223,7 +223,11 @@ void CACHE::handle_fill()
                     writeback_packet.data = block[set][way].data;
                     writeback_packet.instr_id = MSHR.entry[mshr_index].instr_id;
                     writeback_packet.ip = 0; // writeback does not have ip
-                    writeback_packet.type = WRITEBACK;
+                    if (block[set][way].dirty) {
+                        writeback_packet.type = WRITEBACK;   // needs to be written back to lower level
+                    } else {
+                        writeback_packet.type = TRANSFER;    // just moving ownership, not dirty
+                    }
                     writeback_packet.event_cycle = current_core_cycle[fill_cpu];
 
                     lower_level->add_wq(&writeback_packet);
@@ -316,7 +320,17 @@ void CACHE::handle_fill()
 #ifdef PUSH_DTLB_PB
             if ( (cache_type!=IS_DTLB) || (cache_type==IS_DTLB && MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION) )
 #endif	
-                fill_cache(set, way, &MSHR.entry[mshr_index]);
+{
+                    fill_cache(set, way, &MSHR.entry[mshr_index]);
+                    const uint64_t block_addr = MSHR.entry[mshr_index].full_addr >> LOG2_BLOCK_SIZE;
+                    if (cache_type == IS_L1D) {
+                        int inval_result_l2 = ooo_cpu[cpu].L2C.invalidate_entry(block_addr);
+                        int inval_result_llc = uncore.LLC.invalidate_entry(block_addr);
+
+                    } else if (cache_type == IS_L2C) {
+                        int inval_result_llc = uncore.LLC.invalidate_entry(block_addr);
+                    }
+}
 #ifdef PUSH_DTLB_PB
             else if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION)
             {
@@ -695,7 +709,7 @@ if (writeback_cpu == NUM_CPUS)
                 uint8_t  do_fill = 1;
 
                 // is this dirty?
-                if (block[set][way].dirty) {
+                if ((block[set][way].valid && cache_type == IS_L2C)|| ( block[set][way].dirty && cache_type == IS_LLC )) {
 
                     // check if the lower level WQ has enough room to keep this writeback request
                     if (lower_level) { 
@@ -721,7 +735,11 @@ if (writeback_cpu == NUM_CPUS)
                             writeback_packet.data = block[set][way].data;
                             writeback_packet.instr_id = WQ.entry[index].instr_id;
                             writeback_packet.ip = 0;
-                            writeback_packet.type = WRITEBACK;
+                            if (block[set][way].dirty) {
+                                writeback_packet.type = WRITEBACK;   // needs to be written back to lower level
+                            } else {
+                                writeback_packet.type = TRANSFER;    // just moving ownership, not dirty
+                            }
                             writeback_packet.event_cycle = current_core_cycle[writeback_cpu];
 
                             lower_level->add_wq(&writeback_packet);
@@ -787,9 +805,17 @@ if (writeback_cpu == NUM_CPUS)
                     sim_access[writeback_cpu][WQ.entry[index].type]++;
 
                     fill_cache(set, way, &WQ.entry[index]);
+                    if (lower_level && cache_type == IS_L2C) {
+                        auto next_cache = dynamic_cast<CACHE*>(lower_level);
+                        if (next_cache) {
+                            int inval_result = next_cache->invalidate_entry(WQ.entry[index].full_addr >> LOG2_BLOCK_SIZE);
+                        }
+                    }
 
-                    // mark dirty
-                    block[set][way].dirty = 1; 
+                    if (WQ.entry[index].type == TRANSFER)
+                        block[set][way].dirty = 0;   // line is just being transferred, not modified
+                    else
+                        block[set][way].dirty = 1;
 
                     // check fill level
                     if (WQ.entry[index].fill_level < fill_level) {
@@ -1265,6 +1291,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 else if ((cache_type == IS_L1D) && (RQ.entry[index].type != PREFETCH)) {
                     if (PROCESSED.occupancy < PROCESSED.SIZE)
                         PROCESSED.add_queue(&RQ.entry[index]);
+                    if (ooo_cpu[cpu].L2C.check_hit(&RQ.entry[index])!=-1)
+                        assert(0);
+                    if (uncore.LLC.check_hit(&RQ.entry[index])!=-1)
+                        assert(0);
+                    
                 }
                 if(cache_type==0)	//perfect-ITLB and baseline DTLB
                 {
@@ -1388,6 +1419,8 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                     }
                     else if(cache_type == IS_L2C)
                     {
+                        if (uncore.LLC.check_hit(&RQ.entry[index])!=-1)
+                            assert(0);
                         if(RQ.entry[index].send_both_cache)
                         {
                             upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
@@ -2600,7 +2633,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 wq_index = WQ.check_queue(packet);
 
             if (wq_index != -1) {
-
                 if(WQ.entry[wq_index].cpu != packet->cpu)
                 {
                     cout << "Read request from CPU " << packet->cpu << " merging with Write request from CPU " << WQ.entry[wq_index].cpu << endl;
@@ -2639,7 +2671,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         else // data
                             upper_level_dcache[packet->cpu]->return_data(packet);
 
-                    }  
+                    } 
                 }
 
 #ifdef SANITY_CHECK
@@ -3270,7 +3302,12 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
 
             // check for the latest wirtebacks in the write queue 
             // @Vishal: WQ is non-fifo for L1 cache
-
+            packet->full_physical_address = packet->full_addr;
+            if((cache_type == IS_L2C && (ooo_cpu[cpu].L1D.check_hit(packet)!=-1)) || (cache_type == IS_LLC && ((ooo_cpu[cpu].L1D.check_hit(packet)!=-1) || (ooo_cpu[cpu].L2C.check_hit(packet)!=-1)))) {
+                PQ.TO_CACHE++;
+                PQ.ACCESS++;
+                return -1;
+            }
             int wq_index;
             if(cache_type == IS_L1D || cache_type == IS_L1I)
                 wq_index = check_nonfifo_queue(&WQ,packet,false);

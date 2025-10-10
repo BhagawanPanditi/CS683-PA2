@@ -1,22 +1,330 @@
 #include "cache.h"
 
+#define REGION_TRACKER_SIZE 128
+#define MAX_DEGREE 5
+#define MAX_DEMAND_NORMALIZE 20.0 
+#define OUTSTANDING_PREFETCHES 4
+
+#define LINES_PER_PAGE (1u << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE))
+
+using namespace std;
+
+class REGION_TRACKER {
+    public:
+        uint64_t page_num; 
+        uint32_t lru; 
+        int num_offsets; 
+        int32_t offsets[5]; 
+        uint32_t demand_count[5]; 
+        
+        
+        uint32_t issued_count[5]; 
+        uint32_t useful_count[5]; 
+        
+        uint32_t last_line_used;
+
+        REGION_TRACKER() {
+            page_num = 0;
+            lru = 0;
+            num_offsets = 0;
+            
+            last_line_used = (uint32_t)-1; 
+            for (int i = 0; i < 5; i++) {
+                offsets[i] = 0;
+                demand_count[i] = 0;
+                issued_count[i] = 0; 
+                useful_count[i] = 0; 
+            }
+        };
+};
+
+REGION_TRACKER trackers[REGION_TRACKER_SIZE];
+
+// issued prefetch
+map<uint64_t, pair<int, int>> issued_origins; // key: prefetch_line_addr, value: pair<tracker_index, offset_index>
+
+
+// prefetches in cache
+map<uint64_t, pair<int, int>> filled_prefetches; // key: filled_line_addr, value: pair<tracker_index, offset_index>
+
 
 void CACHE::l2c_prefetcher_initialize() 
 {
     cout << "CPU " << cpu << " Region based L2 offset prefetcher" << endl;
+      for (int i=0; i<REGION_TRACKER_SIZE; i++)
+        trackers[i].lru = i;
+    issued_origins.clear();
+    filled_prefetches.clear();
 }
 
-uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in, uint8_t critical_ip_flag)
-{
-   
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in, uint8_t critical_ip_flag) {
+    uint64_t cache_line_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page_num = addr >> LOG2_PAGE_SIZE;
+    uint64_t page_base = page_num << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE);
+    uint32_t page_offset = (uint32_t)(cache_line_addr - page_base);
+
+    int used_tracker_idx = -1;
+    int used_offset_idx = -1;
+
+    // check if damand is prefetched or not (next 10 lines)
+    auto it = filled_prefetches.find(cache_line_addr);
+    if (it != filled_prefetches.end()) {
+        used_tracker_idx = it->second.first;
+        used_offset_idx = it->second.second;
+        
+        if (used_tracker_idx >= 0 && used_tracker_idx < REGION_TRACKER_SIZE && used_offset_idx >= 0 && used_offset_idx < 5) {
+            trackers[used_tracker_idx].useful_count[used_offset_idx]++;
+        }
+        filled_prefetches.erase(it); 
+    }
+
+    // ----------------------------------prefetching logic---------------------------------------------
+    
+    // check if page is being tracked or not
+    int index = -1;
+    for (int i = 0; i < REGION_TRACKER_SIZE; i++) {
+        if (trackers[i].page_num == page_num) {
+            index = i;
+            break;
+        }
+    }
+
+    // if not, put it in lru
+    if (index == -1) {
+        for (int i = 0; i < REGION_TRACKER_SIZE; i++) {
+            if (trackers[i].lru == REGION_TRACKER_SIZE - 1) {
+                index = i;
+                break;
+            }
+        }
+        REGION_TRACKER &t = trackers[index];
+        t.page_num = page_num;
+        t.num_offsets = 0;
+        t.last_line_used = (uint32_t)-1; 
+        for (int j = 0; j < 5; j++) {
+            t.offsets[j] = 0;
+            t.demand_count[j] = 0;
+            t.issued_count[j] = 0;
+            t.useful_count[j] = 0;
+        }
+    }
+
+    REGION_TRACKER &tracker = trackers[index];
+
+    // check if its a first access to this region
+    if (tracker.last_line_used == (uint32_t)-1) {
+        tracker.last_line_used = page_offset;
+        
+        for (int i = 0; i < REGION_TRACKER_SIZE; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return metadata_in;
+    }
+
+    // relative offset
+    int32_t rel_offset = (int32_t)page_offset - (int32_t)tracker.last_line_used;
+
+    // check if offset is being tracked
+    int oi = -1;
+    for (int i = 0; i < tracker.num_offsets; i++) {
+        if (tracker.offsets[i] == rel_offset) {
+            oi = i;
+            break;
+        }
+    }
+
+    // if not, add this new pattern
+    if (oi == -1) {
+        if (tracker.num_offsets < 5) {
+            
+            oi = tracker.num_offsets;
+            tracker.num_offsets++;
+        } else {
+            
+            int min_i = 0;
+            for (int i = 1; i < 5; i++) {
+                if (tracker.demand_count[i] < tracker.demand_count[min_i])
+                    min_i = i;
+            }
+            oi = min_i;
+        }
+        tracker.offsets[oi] = rel_offset;
+        tracker.demand_count[oi] = 0;
+        tracker.issued_count[oi] = 0;
+        tracker.useful_count[oi] = 0;
+    }
+
+    // inc the demand count
+    tracker.demand_count[oi]++;
+    
+    // prefetch only if demanded atleast 2 times
+    //if (tracker.demand_count[oi] < 2) {
+        //tracker.last_line_used = page_offset;
+        //// Update LRU before exiting
+        //for (int i = 0; i < REGION_TRACKER_SIZE; i++) {
+        //    if (trackers[i].lru < trackers[index].lru)
+        //        trackers[i].lru++;
+        //}
+        //trackers[index].lru = 0;
+        //return metadata_in; 
+    //}
+    
+
+    // degree calculation
+    int degree = 1;
+    {
+        uint32_t total_demand = 0;
+        uint32_t num_patterns = 0;
+        
+        for (int i = 0; i < tracker.num_offsets; i++) {
+            if (tracker.demand_count[i] >= 2) { 
+                total_demand += tracker.demand_count[i];
+                num_patterns++;
+            }
+        }
+
+        if (num_patterns > 0) {
+            uint32_t avg_demand = total_demand / num_patterns;
+            
+            // Simple proportional scaling: 1 + (avg_demand / 5)
+            degree = 1 + (int)(avg_demand / 5); 
+        }
+        
+        if (degree > MAX_DEGREE) degree = MAX_DEGREE;
+        if (degree < 1) degree = 1;
+    }
+
+    // score calculation
+
+    int best_idx[5];
+    uint32_t best_count[5];
+    int n_best = 0;
+    for (int i = 0; i < tracker.num_offsets; i++) {
+        if (i == oi) continue;
+        if (tracker.demand_count[i] < 2) continue;
+
+        int32_t predicted_offset_signed = (int32_t)page_offset + tracker.offsets[i];
+        if (predicted_offset_signed < 0 || predicted_offset_signed >= (int32_t)LINES_PER_PAGE) continue;
+        uint32_t predicted_offset = (uint32_t)predicted_offset_signed;
+
+        if (predicted_offset == page_offset) continue;
+        
+        uint32_t score = 0;
+        double accuracy = 0.0;
+        
+        if (tracker.issued_count[i] == 0) {
+            accuracy = 0.5;
+        } else {
+            //accuracy = (double)tracker.useful_count[i] / tracker.issued_count[i];
+            accuracy = (tracker.useful_count[i] + 1.0) / (tracker.issued_count[i] + 2.0);
+        }
+
+        if (tracker.issued_count[i] > 0) {
+            uint32_t wasted = tracker.issued_count[i] - tracker.useful_count[i];
+            //if (wasted > 3) {
+              //  accuracy = max(0.0, accuracy * 0.01);
+            //}
+            accuracy *= pow(0.9, wasted);
+        }
+        
+        //if (accuracy <= MIN_ACCURACY_THRESHOLD) continue;
+
+        double normalized_demand = min(1.0, (double)tracker.demand_count[i] / MAX_DEMAND_NORMALIZE);
+
+        double hybrid_score_double = (normalized_demand * 0) + (accuracy * 1);
+        
+        score = (uint32_t)(hybrid_score_double * 100); 
+        //score = demand_count[i];
+        if (score == 0) continue;
+        
+        int pos = n_best;
+        while (pos > 0 && score > best_count[pos - 1]) {
+            best_count[pos] = best_count[pos - 1];
+            best_idx[pos] = best_idx[pos - 1];
+            pos--;
+        }
+        best_count[pos] = score;
+        best_idx[pos] = i;
+        n_best++;
+        if (n_best >= 5) break;
+    }
+    //cout<<"n_best: "<< n_best;
+    
+    if (degree > n_best) degree = n_best;
+
+    // issue prefetches
+    int issued_count_loop = 0;
+    for (int k = 0; issued_count_loop < degree && k < n_best; k++) {
+        int i = best_idx[k];
+        int32_t predicted_offset_signed = (int32_t)page_offset + tracker.offsets[i];
+        
+        if (predicted_offset_signed < 0 || predicted_offset_signed >= (int32_t)LINES_PER_PAGE) continue;
+        uint32_t predicted_offset = (uint32_t)predicted_offset_signed;
+        if (predicted_offset == page_offset) continue; 
+
+        uint64_t prefetch_addr = (page_base + predicted_offset) << LOG2_BLOCK_SIZE;
+        uint64_t prefetch_line_addr = prefetch_addr >> LOG2_BLOCK_SIZE;
+
+        
+        if (MSHR.occupancy < (MSHR.SIZE >> 1))
+            prefetch_line(ip, addr, prefetch_addr, FILL_L2, 0);
+        else
+            prefetch_line(ip, addr, prefetch_addr, FILL_LLC, 0);
+
+        // inc issue issued_count
+        tracker.issued_count[i]++;
+        issued_origins[prefetch_line_addr] = make_pair(index, i); 
+
+        issued_count_loop++;
+    }
+
+    
+    tracker.last_line_used = page_offset;
+    for (int i = 0; i < REGION_TRACKER_SIZE; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+
+
+    return metadata_in;
 }
 
 uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t match, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
 {
-  return metadata_in;
+    uint64_t cache_line_addr = addr >> LOG2_BLOCK_SIZE;
+    
+    
+    auto it = issued_origins.find(cache_line_addr);
+
+    if (it != issued_origins.end()) {
+        
+        if (prefetch == 1) {
+            
+            filled_prefetches[cache_line_addr] = it->second;
+        } else {
+            
+        }
+        
+        issued_origins.erase(it);
+    }
+    
+    
+    if (evicted_addr != 0) {
+        uint64_t evicted_line_addr = evicted_addr >> LOG2_BLOCK_SIZE;
+        auto filled_it = filled_prefetches.find(evicted_line_addr);
+        if (filled_it != filled_prefetches.end()) {
+            
+            filled_prefetches.erase(filled_it);
+        }
+    }
+    
+    return metadata_in;
 }
 
 void CACHE::l2c_prefetcher_final_stats()
 {
-
+    cout << "CPU " << cpu << " L2C Region-based offset prefetcher final stats" << endl;
 }

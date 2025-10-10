@@ -1,0 +1,9 @@
+Trace,Configuration,IPC,L1D_MPKI,L2C_MPKI,LLC_MPKI,Speedup_over_Non_Inclusive
+trace1,Exclusive,0.5254,66.0505,96.4905,70.4327,0.9922
+trace1,Non-Inclusive,0.5295,66.0505,40.5813,40.1098,N/A
+trace2,Exclusive,0.4581,78.0220,113.8380,83.1502,0.9899
+trace2,Non-Inclusive,0.4628,78.0219,47.7420,47.3799,N/A
+trace3,Exclusive,0.8383,35.7547,52.3442,38.2563,0.9989
+trace3,Non-Inclusive,0.8393,35.7547,22.0985,21.7126,N/A
+trace4,Exclusive,0.4598,77.7246,113.4660,82.8675,0.9952
+trace4,Non-Inclusive,0.4621,77.7237,47.6566,47.1964,N/A
