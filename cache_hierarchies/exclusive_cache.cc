@@ -320,15 +320,17 @@ void CACHE::handle_fill()
 #ifdef PUSH_DTLB_PB
             if ( (cache_type!=IS_DTLB) || (cache_type==IS_DTLB && MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION) )
 #endif	
-            {
-                fill_cache(set, way, &MSHR.entry[mshr_index]);
-                if (lower_level && (cache_type == IS_L1D || cache_type == IS_L1I || cache_type == IS_L2C)) {
-                    auto next_cache = dynamic_cast<CACHE*>(lower_level);
-                    if (next_cache) {
-                        int inval_result = next_cache->invalidate_entry(MSHR.entry[mshr_index].full_addr >> LOG2_BLOCK_SIZE);
+{
+                    fill_cache(set, way, &MSHR.entry[mshr_index]);
+                    const uint64_t block_addr = MSHR.entry[mshr_index].full_addr >> LOG2_BLOCK_SIZE;
+                    if (cache_type == IS_L1D) {
+                        int inval_result_l2 = ooo_cpu[cpu].L2C.invalidate_entry(block_addr);
+                        int inval_result_llc = uncore.LLC.invalidate_entry(block_addr);
+
+                    } else if (cache_type == IS_L2C) {
+                        int inval_result_llc = uncore.LLC.invalidate_entry(block_addr);
                     }
-                }
-            }
+}
 #ifdef PUSH_DTLB_PB
             else if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION)
             {
@@ -1289,6 +1291,11 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 else if ((cache_type == IS_L1D) && (RQ.entry[index].type != PREFETCH)) {
                     if (PROCESSED.occupancy < PROCESSED.SIZE)
                         PROCESSED.add_queue(&RQ.entry[index]);
+                    if (ooo_cpu[cpu].L2C.check_hit(&RQ.entry[index])!=-1)
+                        assert(0);
+                    if (uncore.LLC.check_hit(&RQ.entry[index])!=-1)
+                        assert(0);
+                    
                 }
                 if(cache_type==0)	//perfect-ITLB and baseline DTLB
                 {
@@ -1412,6 +1419,8 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                     }
                     else if(cache_type == IS_L2C)
                     {
+                        if (uncore.LLC.check_hit(&RQ.entry[index])!=-1)
+                            assert(0);
                         if(RQ.entry[index].send_both_cache)
                         {
                             upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
@@ -2624,7 +2633,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                 wq_index = WQ.check_queue(packet);
 
             if (wq_index != -1) {
-
                 if(WQ.entry[wq_index].cpu != packet->cpu)
                 {
                     cout << "Read request from CPU " << packet->cpu << " merging with Write request from CPU " << WQ.entry[wq_index].cpu << endl;
@@ -2663,7 +2671,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         else // data
                             upper_level_dcache[packet->cpu]->return_data(packet);
 
-                    }  
+                    } 
                 }
 
 #ifdef SANITY_CHECK
@@ -3295,7 +3303,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
             // check for the latest wirtebacks in the write queue 
             // @Vishal: WQ is non-fifo for L1 cache
             packet->full_physical_address = packet->full_addr;
-            if((fill_level == FILL_L2 && ooo_cpu[cpu].L1D.check_hit(packet)) || (fill_level == FILL_LLC && (ooo_cpu[cpu].L1D.check_hit(packet) || ooo_cpu[cpu].L2C.check_hit(packet)))){
+            if((cache_type == IS_L2C && (ooo_cpu[cpu].L1D.check_hit(packet)!=-1)) || (cache_type == IS_LLC && ((ooo_cpu[cpu].L1D.check_hit(packet)!=-1) || (ooo_cpu[cpu].L2C.check_hit(packet)!=-1)))) {
                 PQ.TO_CACHE++;
                 PQ.ACCESS++;
                 return -1;
